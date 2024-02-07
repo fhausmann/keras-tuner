@@ -20,10 +20,11 @@ import os
 import random
 import threading
 import warnings
+from datetime import datetime
 
 import numpy as np
-import tensorflow as tf
 
+from keras_tuner import backend
 from keras_tuner import utils
 from keras_tuner.api_export import keras_tuner_export
 from keras_tuner.engine import hyperparameters as hp_module
@@ -113,7 +114,139 @@ def synchronized(func, *args, **kwargs):
     return wrapped_func
 
 
-@keras_tuner_export("keras_tuner.Oracle")
+# TODO: Add more extensive display.
+class Display(stateful.Stateful):
+    def __init__(self, oracle, verbose=1):
+        self.verbose = verbose
+        self.oracle = oracle
+        self.col_width = 18
+
+        # Start time for the overall search
+        self.search_start = None
+
+        # Start time of the trials
+        # {trial_id: start_time}
+        self.trial_start = {}
+        # Trial number of the trials, starting from #1.
+        # {trial_id: trial_number}
+        self.trial_number = {}
+
+    def get_state(self):
+        return {
+            "search_start": self.search_start.isoformat()
+            if self.search_start is not None
+            else self.search_start,
+            "trial_start": {
+                key: value.isoformat()
+                for key, value in self.trial_start.items()
+            },
+            "trial_number": self.trial_number,
+        }
+
+    def set_state(self, state):
+        self.search_start = (
+            datetime.fromisoformat(state["search_start"])
+            if state["search_start"] is not None
+            else state["search_start"]
+        )
+        self.trial_start = {
+            key: datetime.fromisoformat(value)
+            for key, value in state["trial_start"].items()
+        }
+
+        self.trial_number = state["trial_number"]
+
+    def on_trial_begin(self, trial):
+        if self.verbose < 1:
+            return
+
+        start_time = datetime.now()
+        self.trial_start[trial.trial_id] = start_time
+        if self.search_start is None:
+            self.search_start = start_time
+        current_number = len(self.oracle.trials)
+        self.trial_number[trial.trial_id] = current_number
+
+        print()
+        print(f"Search: Running Trial #{current_number}")
+        print()
+        self.show_hyperparameter_table(trial)
+        print()
+
+    def on_trial_end(self, trial):
+        if self.verbose < 1:
+            return
+
+        utils.try_clear()
+
+        time_taken_str = self.format_duration(
+            datetime.now() - self.trial_start[trial.trial_id]
+        )
+        print(
+            f"Trial {self.trial_number[trial.trial_id]} "
+            f"Complete [{time_taken_str}]"
+        )
+
+        if trial.score is not None:
+            print(f"{self.oracle.objective.name}: {trial.score}")
+
+        print()
+        best_trials = self.oracle.get_best_trials()
+        best_score = best_trials[0].score if len(best_trials) > 0 else None
+        print(f"Best {self.oracle.objective.name} So Far: {best_score}")
+
+        time_elapsed_str = self.format_duration(
+            datetime.now() - self.search_start
+        )
+        print(f"Total elapsed time: {time_elapsed_str}")
+
+    def show_hyperparameter_table(self, trial):
+        template = "{{0:{0}}}|{{1:{0}}}|{{2}}".format(self.col_width)
+        best_trials = self.oracle.get_best_trials()
+        best_trial = best_trials[0] if len(best_trials) > 0 else None
+        if trial.hyperparameters.values:
+            print(
+                template.format("Value", "Best Value So Far", "Hyperparameter")
+            )
+            for hp, value in trial.hyperparameters.values.items():
+                best_value = (
+                    best_trial.hyperparameters.values.get(hp)
+                    if best_trial
+                    else "?"
+                )
+                print(
+                    template.format(
+                        self.format_value(value),
+                        self.format_value(best_value),
+                        hp,
+                    )
+                )
+        else:
+            print("default configuration")
+
+    def format_value(self, val):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return f"{val:.5g}"
+        val_str = str(val)
+        if len(val_str) > self.col_width:
+            val_str = f"{val_str[:self.col_width - 3]}..."
+        return val_str
+
+    def format_duration(self, d):
+        s = round(d.total_seconds())
+        d = s // 86400
+        s %= 86400
+        h = s // 3600
+        s %= 3600
+        m = s // 60
+        s %= 60
+
+        if d > 0:
+            return f"{d:d}d {h:02d}h {m:02d}m {s:02d}s"
+        return f"{h:02d}h {m:02d}m {s:02d}s"
+
+
+@keras_tuner_export(["keras_tuner.Oracle", "keras_tuner.engine.oracle.Oracle"])
 class Oracle(stateful.Stateful):
     """Implements a hyperparameter optimization algorithm.
 
@@ -209,6 +342,8 @@ class Oracle(stateful.Stateful):
         self._run_times = collections.defaultdict(lambda: 0)
         # Used as a queue of trial_id to retry
         self._retry_queue = []
+        # Client Tuner IDs
+        self.tuner_ids = set()
 
         self.seed = seed or random.randint(1, 10000)
         self._seed_state = self.seed
@@ -233,6 +368,19 @@ class Oracle(stateful.Stateful):
         # Handling the retries and failed trials.
         self.max_retries_per_trial = max_retries_per_trial
         self.max_consecutive_failed_trials = max_consecutive_failed_trials
+
+        # Print the logs to screen
+        self._display = Display(oracle=self)
+
+    @property
+    def verbose(self):
+        return self._display.verbose
+
+    @verbose.setter
+    def verbose(self, value):
+        if value == "auto":
+            value = 1
+        self._display.verbose = value
 
     def _populate_space(self, trial_id):
         warnings.warn(
@@ -303,12 +451,16 @@ class Oracle(stateful.Stateful):
         if tuner_id in self.ongoing_trials:
             return self.ongoing_trials[tuner_id]
 
+        # Record all running client Tuner IDs.
+        self.tuner_ids.add(tuner_id)
+
         # Pick the Trials waiting for retry first.
         if len(self._retry_queue) > 0:
             trial = self.trials[self._retry_queue.pop()]
             trial.status = trial_module.TrialStatus.RUNNING
             self.ongoing_trials[tuner_id] = trial
             self.save()
+            self._display.on_trial_begin(trial)
             return trial
 
         # Make the trial_id the current number of trial, pre-padded with 0s
@@ -342,6 +494,11 @@ class Oracle(stateful.Stateful):
             self.start_order.append(trial_id)
             self._save_trial(trial)
             self.save()
+            self._display.on_trial_begin(trial)
+
+        # Remove the client Tuner ID when triggered the client to exit
+        if status == trial_module.TrialStatus.STOPPED:
+            self.tuner_ids.remove(tuner_id)
 
         return trial
 
@@ -403,11 +560,6 @@ class Oracle(stateful.Stateful):
                 needed.). `trial.message` is an optional string, which is the
                 error message if the trial status is `"INVALID"` or `"FAILED"`.
         """
-        for tuner_id, ongoing_trial in self.ongoing_trials.items():
-            if ongoing_trial.trial_id == trial.trial_id:
-                self.ongoing_trials.pop(tuner_id)
-                break
-
         # To support parallel tuning, the information in the `trial` argument is
         # synced back to the `Oracle`. Update the self.trials with the given
         # trial.
@@ -435,6 +587,15 @@ class Oracle(stateful.Stateful):
 
         self._save_trial(trial)
         self.save()
+
+        self._display.on_trial_end(trial)
+
+        # Pop the ongoing trial at last, which would notify the chief server to
+        # stop when ongoing_trials is empty.
+        for tuner_id, ongoing_trial in self.ongoing_trials.items():
+            if ongoing_trial.trial_id == trial.trial_id:
+                self.ongoing_trials.pop(tuner_id)
+                break
 
     def _retry(self, trial):
         """Send the trial for retry if needed.
@@ -545,6 +706,7 @@ class Oracle(stateful.Stateful):
             "seed_state": self._seed_state,
             "tried_so_far": list(self._tried_so_far),
             "id_to_hash": self._id_to_hash,
+            "display": self._display.get_state(),
         }
 
     def set_state(self, state):
@@ -566,6 +728,7 @@ class Oracle(stateful.Stateful):
         self._tried_so_far = set(state["tried_so_far"])
         self._id_to_hash = collections.defaultdict(lambda: None)
         self._id_to_hash.update(state["id_to_hash"])
+        self._display.set_state(state["display"])
 
     def _set_project_dir(self, directory, project_name):
         """Sets the project directory and reloads the Oracle."""
@@ -584,7 +747,7 @@ class Oracle(stateful.Stateful):
 
     def reload(self):
         # Reload trials from their own files.
-        trial_fnames = tf.io.gfile.glob(
+        trial_fnames = backend.io.glob(
             os.path.join(self._project_dir, "trial_*", "trial.json")
         )
         for fname in trial_fnames:

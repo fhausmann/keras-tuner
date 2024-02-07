@@ -17,19 +17,28 @@
 import contextlib
 import copy
 import gc
+import math
 import os
 
 import numpy as np
-from tensorboard.plugins.hparams import api as hparams_api
-from tensorflow import keras
 
+from keras_tuner import backend
 from keras_tuner import errors
+from keras_tuner import utils
 from keras_tuner.api_export import keras_tuner_export
+from keras_tuner.backend import config
+from keras_tuner.backend import keras
 from keras_tuner.engine import base_tuner
 from keras_tuner.engine import tuner_utils
 
 
-@keras_tuner_export(["keras_tuner.Tuner", "keras_tuner.tuners.Tuner"])
+@keras_tuner_export(
+    [
+        "keras_tuner.Tuner",
+        "keras_tuner.tuners.Tuner",
+        "keras_tuner.engine.tuner.Tuner",
+    ]
+)
 class Tuner(base_tuner.BaseTuner):
     """Tuner class for Keras models.
 
@@ -168,13 +177,23 @@ class Tuner(base_tuner.BaseTuner):
             )
         return model
 
+    def _filter_metrics(self, metrics):
+        if metrics is None:
+            return None
+        return list(
+            filter(
+                lambda metric: metric.name not in ("loss", "compile_metric"),
+                metrics,
+            )
+        )
+
     def _override_compile_args(self, model):
         with maybe_distribute(self.distribution_strategy):
             if self.optimizer or self.loss or self.metrics:
                 compile_kwargs = {
                     "optimizer": model.optimizer,
                     "loss": model.loss,
-                    "metrics": model.metrics,
+                    "metrics": self._filter_metrics(model.metrics),
                 }
                 if self.loss:
                     compile_kwargs["loss"] = self.loss
@@ -212,6 +231,14 @@ class Tuner(base_tuner.BaseTuner):
         hp = trial.hyperparameters
         model = self._try_build(hp)
         results = self.hypermodel.fit(hp, model, *args, **kwargs)
+
+        # Save the build config for model loading later.
+        if backend.config.multi_backend():
+            utils.save_json(
+                self._get_build_config_fname(trial.trial_id),
+                model.get_build_config(),
+            )
+
         tuner_utils.validate_trial_results(
             results, self.oracle.objective, "HyperModel.fit()"
         )
@@ -291,6 +318,13 @@ class Tuner(base_tuner.BaseTuner):
 
     def load_model(self, trial):
         model = self._try_build(trial.hyperparameters)
+
+        # Build model to create the weights.
+        if backend.config.multi_backend() and not model.built:
+            model.build_from_config(
+                utils.load_json(self._get_build_config_fname(trial.trial_id))
+            )
+
         # Reload best checkpoint.
         # Only load weights to avoid loading `custom_objects`.
         with maybe_distribute(self.distribution_strategy):
@@ -378,6 +412,14 @@ class Tuner(base_tuner.BaseTuner):
         return callbacks
 
     def _configure_tensorboard_dir(self, callbacks, trial, execution=0):
+        # Only import tensorboard when using tensorflow backend to avoid
+        # importing tensorflow with other backend (tensorboard would import
+        # tensorflow).
+        if backend.config.backend() != "tensorflow":
+            return
+
+        from tensorboard.plugins.hparams import api as hparams_api
+
         for callback in callbacks:
             if callback.__class__.__name__ == "TensorBoard":
                 # Patch TensorBoard log_dir and add HParams KerasCallback
@@ -386,7 +428,8 @@ class Tuner(base_tuner.BaseTuner):
                 )
                 callback.log_dir = logdir
                 hparams = tuner_utils.convert_hyperparams_to_hparams(
-                    trial.hyperparameters
+                    trial.hyperparameters,
+                    hparams_api,
                 )
                 callbacks.append(
                     hparams_api.KerasCallback(
@@ -403,20 +446,26 @@ class Tuner(base_tuner.BaseTuner):
         return os.path.join(
             # Each checkpoint is saved in its own directory.
             self.get_trial_dir(trial_id),
-            "checkpoint",
+            "checkpoint.weights.h5" if config.multi_backend() else "checkpoint",
+        )
+
+    def _get_build_config_fname(self, trial_id):
+        return os.path.join(
+            # Each checkpoint is saved in its own directory.
+            self.get_trial_dir(trial_id),
+            "build_config.json",
         )
 
 
 def maybe_compute_model_size(model):
     """Compute the size of a given model, if it has been built."""
     if model.built:
-        params = [
-            keras.backend.count_params(p) for p in model.trainable_weights
-        ]
+        params = [math.prod(p.shape) for p in model.trainable_weights]
         return int(np.sum(params))
     return 0
 
 
+@keras_tuner_export("keras_tuner.engine.tuner.maybe_distribute")
 @contextlib.contextmanager
 def maybe_distribute(distribution_strategy):
     """Distributes if distribution_strategy is set."""

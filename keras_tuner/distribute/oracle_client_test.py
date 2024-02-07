@@ -14,18 +14,15 @@
 """Tests for distributed tuning."""
 
 import copy
-import logging
 import os
-import threading
 from unittest import mock
 
 import numpy as np
 import portpicker
 import pytest
-import tensorflow as tf
-from tensorflow import keras
 
 import keras_tuner
+from keras_tuner.backend import keras
 from keras_tuner.distribute import oracle_client
 from keras_tuner.distribute import utils as dist_utils
 from keras_tuner.engine import hyperparameters as hp_module
@@ -41,19 +38,18 @@ class SimpleTuner(keras_tuner.engine.base_tuner.BaseTuner):
 
     def save_model(self, trial_id, score, step=0):
         save_path = os.path.join(self.project_dir, trial_id)
-        with tf.io.gfile.GFile(save_path, "w") as f:
+        with open(save_path, "w") as f:
             f.write(str(score))
 
     def load_model(self, trial):
         save_path = os.path.join(self.project_dir, trial.trial_id)
-        with tf.io.gfile.GFile(save_path, "r") as f:
+        with open(save_path, "r") as f:
             score = int(f.read())
         return score
 
 
 def test_base_tuner_distribution(tmp_path):
     num_workers = 3
-    barrier = threading.Barrier(num_workers)
 
     def _test_base_tuner():
         def build_model(hp):
@@ -68,43 +64,33 @@ def test_base_tuner_distribution(tmp_path):
         )
         tuner.search()
 
-        # Only worker makes it to this point, server runs until thread stops.
-        assert dist_utils.has_chief_oracle()
-        assert not dist_utils.is_chief_oracle()
-        assert isinstance(
-            tuner.oracle, keras_tuner.distribute.oracle_client.OracleClient
-        )
+        if dist_utils.is_chief_oracle():
+            # Model is just a score.
+            scores = tuner.get_best_models(10)
+            assert len(scores)
+            assert scores == sorted(copy.copy(scores), reverse=True)
 
-        barrier.wait(60)
-
-        # Model is just a score.
-        scores = tuner.get_best_models(10)
-        assert len(scores)
-        assert scores == sorted(copy.copy(scores), reverse=True)
-
-    mock_distribute.mock_distribute(_test_base_tuner, num_workers=num_workers)
+    mock_distribute.mock_distribute(
+        _test_base_tuner, num_workers=num_workers, wait_for_chief=True
+    )
 
 
 def test_random_search(tmp_path):
     # TensorFlow model building and execution is not thread-safe.
     num_workers = 1
 
+    x = np.random.uniform(-1, 1, size=(2, 5))
+    y = np.ones((2,))
+
     def _test_random_search():
         def build_model(hp):
             model = keras.Sequential()
-            model.add(keras.layers.Dense(3, input_shape=(5,)))
-            for i in range(hp.Int("num_layers", 1, 3)):
-                model.add(
-                    keras.layers.Dense(
-                        hp.Int("num_units_%i" % i, 1, 3), activation="relu"
-                    )
-                )
-            model.add(keras.layers.Dense(1, activation="sigmoid"))
-            model.compile("sgd", "binary_crossentropy")
+            model.add(
+                keras.layers.Dense(hp.Int("num_units", 1, 3), input_shape=(5,))
+            )
+            model.add(keras.layers.Dense(1))
+            model.compile(loss="mse")
             return model
-
-        x = np.random.uniform(-1, 1, size=(2, 5))
-        y = np.ones((2, 1))
 
         tuner = keras_tuner.tuners.RandomSearch(
             hypermodel=build_model,
@@ -112,27 +98,25 @@ def test_random_search(tmp_path):
             max_trials=10,
             directory=tmp_path,
         )
-
-        # Only worker makes it to this point, server runs until thread stops.
-        assert dist_utils.has_chief_oracle()
-        assert not dist_utils.is_chief_oracle()
-        assert isinstance(
-            tuner.oracle, keras_tuner.distribute.oracle_client.OracleClient
+        tuner.search(
+            x, y, validation_data=(x, y), epochs=1, batch_size=2, verbose=0
         )
-
-        tuner.search(x, y, validation_data=(x, y), epochs=1, batch_size=2)
 
         # Suppress warnings about optimizer state not being restored by
         # tf.keras.
-        tf.get_logger().setLevel(logging.ERROR)
 
-        trials = tuner.oracle.get_best_trials(2)
-        assert trials[0].score <= trials[1].score
+        if dist_utils.is_chief_oracle():
+            trials = tuner.oracle.get_best_trials(2)
+            assert trials[0].score <= trials[1].score
 
-        models = tuner.get_best_models(2)
-        assert models[0].evaluate(x, y) <= models[1].evaluate(x, y)
+            models = tuner.get_best_models(2)
+            assert models[0].evaluate(x, y, verbose=0) <= models[1].evaluate(
+                x, y, verbose=0
+            )
 
-    mock_distribute.mock_distribute(_test_random_search, num_workers)
+    mock_distribute.mock_distribute(
+        _test_random_search, num_workers, wait_for_chief=True
+    )
 
 
 def test_client_no_attribute_error():

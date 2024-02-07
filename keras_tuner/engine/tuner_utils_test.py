@@ -12,21 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
 import os
 
 import numpy as np
 import pytest
-from tensorflow import keras
 
+from keras_tuner.backend import keras
 from keras_tuner.engine import objective as obj_module
 from keras_tuner.engine import tuner_utils
-from keras_tuner.tuners import gridsearch
 
 
 def test_save_best_epoch_with_single_objective(tmp_path):
     objective = obj_module.create_objective("val_loss")
-    filepath = os.path.join(tmp_path, "saved_weights")
+    filepath = os.path.join(tmp_path, "saved_weights.weights.h5")
     callback = tuner_utils.SaveBestEpoch(objective, filepath)
 
     model = keras.Sequential([keras.layers.Dense(1)])
@@ -48,7 +46,7 @@ def test_save_best_epoch_with_single_objective(tmp_path):
 
 def test_save_best_epoch_with_multi_objective(tmp_path):
     objective = obj_module.create_objective(["val_loss", "val_mae"])
-    filepath = os.path.join(tmp_path, "saved_weights")
+    filepath = os.path.join(tmp_path, "saved_weights.weights.h5")
     callback = tuner_utils.SaveBestEpoch(objective, filepath)
 
     model = keras.Sequential([keras.layers.Dense(1)])
@@ -72,7 +70,7 @@ def test_save_best_epoch_with_multi_objective(tmp_path):
 
 def test_save_best_epoch_with_default_objective(tmp_path):
     objective = obj_module.create_objective(None)
-    filepath = os.path.join(tmp_path, "saved_weights")
+    filepath = os.path.join(tmp_path, "saved_weights.weights.h5")
     callback = tuner_utils.SaveBestEpoch(objective, filepath)
 
     model = keras.Sequential([keras.layers.Dense(1)])
@@ -174,9 +172,3 @@ def test_get_best_step_return_average_epoch():
         )
         == 3
     )
-
-
-def test_display_format_duration_large_d():
-    oracle = gridsearch.GridSearchOracle()
-    d = datetime.datetime(2020, 5, 17) - datetime.datetime(2020, 5, 10)
-    assert tuner_utils.Display(oracle).format_duration(d) == "7d 00h 00m 00s"

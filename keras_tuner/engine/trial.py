@@ -15,18 +15,18 @@
 
 
 import hashlib
-import json
 import random
 import time
 
-import tensorflow as tf
-
 from keras_tuner import protos
+from keras_tuner import utils
+from keras_tuner.api_export import keras_tuner_export
 from keras_tuner.engine import hyperparameters as hp_module
 from keras_tuner.engine import metrics_tracking
 from keras_tuner.engine import stateful
 
 
+@keras_tuner_export(["keras_tuner.engine.trial.TrialStatus"])
 class TrialStatus:
     # The Trial may start to run.
     RUNNING = "RUNNING"
@@ -85,6 +85,7 @@ class TrialStatus:
             raise ValueError(f"Unknown status {proto}")
 
 
+@keras_tuner_export(["keras_tuner.engine.trial.Trial"])
 class Trial(stateful.Stateful):
     """The runs with the same set of hyperparameter values.
 
@@ -170,10 +171,7 @@ class Trial(stateful.Stateful):
 
     @classmethod
     def load(cls, fname):
-        with tf.io.gfile.GFile(fname, "r") as f:
-            trial_data = f.read()
-        state_data = json.loads(trial_data)
-        return cls.from_state(state_data)
+        return cls.from_state(utils.load_json(fname))
 
     def to_proto(self):
         if self.score is not None:

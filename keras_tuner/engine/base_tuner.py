@@ -19,11 +19,11 @@ import os
 import traceback
 import warnings
 
-import tensorflow as tf
-
+from keras_tuner import backend
 from keras_tuner import config as config_module
 from keras_tuner import errors
 from keras_tuner import utils
+from keras_tuner.api_export import keras_tuner_export
 from keras_tuner.distribute import utils as dist_utils
 from keras_tuner.engine import hypermodel as hm_module
 from keras_tuner.engine import oracle as oracle_module
@@ -32,6 +32,7 @@ from keras_tuner.engine import trial as trial_module
 from keras_tuner.engine import tuner_utils
 
 
+@keras_tuner_export(["keras_tuner.engine.base_tuner.BaseTuner"])
 class BaseTuner(stateful.Stateful):
     """Tuner base class.
 
@@ -116,40 +117,27 @@ class BaseTuner(stateful.Stateful):
         self.project_name = project_name or "untitled_project"
         self.oracle._set_project_dir(self.directory, self.project_name)
 
-        if overwrite and tf.io.gfile.exists(self.project_dir):
-            tf.io.gfile.rmtree(self.project_dir)
+        if overwrite and backend.io.exists(self.project_dir):
+            backend.io.rmtree(self.project_dir)
 
         # To support tuning distribution.
         self.tuner_id = os.environ.get("KERASTUNER_TUNER_ID", "tuner0")
 
         # Reloading state.
-        if not overwrite and tf.io.gfile.exists(self._get_tuner_fname()):
-            tf.get_logger().info(
-                f"Reloading Tuner from {self._get_tuner_fname()}"
-            )
+        if not overwrite and backend.io.exists(self._get_tuner_fname()):
+            print(f"Reloading Tuner from {self._get_tuner_fname()}")
             self.reload()
         else:
             # Only populate initial space if not reloading.
             self._populate_initial_space()
 
         # Run in distributed mode.
-        if dist_utils.is_chief_oracle():
-            # Blocks forever.
-            # Avoid import at the top, to avoid inconsistent protobuf versions.
-            from keras_tuner.distribute import oracle_chief
-
-            oracle_chief.start_server(self.oracle)
-        elif dist_utils.has_chief_oracle():
+        if dist_utils.has_chief_oracle() and not dist_utils.is_chief_oracle():
             # Proxies requests to the chief oracle.
             # Avoid import at the top, to avoid inconsistent protobuf versions.
             from keras_tuner.distribute import oracle_client
 
             self.oracle = oracle_client.OracleClient(self.oracle)
-
-        # In parallel tuning, everything below in __init__() is for workers
-        # only.
-        # Logs etc
-        self._display = tuner_utils.Display(oracle=self.oracle)
 
     def _activate_all_conditions(self):
         # Lists of stacks of conditions used during `explore_space()`.
@@ -213,14 +201,30 @@ class BaseTuner(stateful.Stateful):
               `run_trial`, for example the training and validation data.
         """
         if "verbose" in fit_kwargs:
-            self._display.verbose = fit_kwargs.get("verbose")
+            verbose = fit_kwargs.get("verbose")
+
+            # Only set verbosity on chief or when not running in parallel.
+            if (
+                not dist_utils.has_chief_oracle()
+                or dist_utils.is_chief_oracle()
+            ):
+                self.oracle.verbose = verbose
+
+        if dist_utils.is_chief_oracle():
+            # Blocks until all the trials are finished.
+            # Avoid import at the top, to avoid inconsistent protobuf versions.
+            from keras_tuner.distribute import oracle_chief
+
+            self.save()
+            oracle_chief.start_server(self.oracle)
+            return
+
         self.on_search_begin()
         while True:
             self.pre_create_trial()
             trial = self.oracle.create_trial(self.tuner_id)
             if trial.status == trial_module.TrialStatus.STOPPED:
                 # Oracle triggered exit.
-                tf.get_logger().info("Oracle triggered exit")
                 break
             if trial.status == trial_module.TrialStatus.IDLE:
                 # Oracle is calculating, resend request.
@@ -324,7 +328,7 @@ class BaseTuner(stateful.Stateful):
         Args:
             trial: A `Trial` instance.
         """
-        self._display.on_trial_begin(self.oracle.get_trial(trial.trial_id))
+        pass
 
     def on_trial_end(self, trial):
         """Called at the end of a trial.
@@ -333,8 +337,6 @@ class BaseTuner(stateful.Stateful):
             trial: A `Trial` instance.
         """
         self.oracle.end_trial(trial)
-        # Display needs the updated trial scored by the Oracle.
-        self._display.on_trial_end(self.oracle.get_trial(trial.trial_id))
         self.save()
 
     def on_search_begin(self):
